@@ -1,0 +1,19 @@
+<VirtualHost *:{{ site_port }}>
+    ServerName {{ site_domain }}
+{% if site_alias | length > 0 %}
+    ServerAlias {{ site_alias }}
+{% endif %}
+{% if admin_email | length > 0 %}
+    ServerAdmin {{ admin_email }}
+{% endif %}
+
+    DocumentRoot /var/www/{{ site_domain }}/public_html
+    ErrorLog /var/www/{{ site_domain }}/logs/error.log
+    CustomLog /var/www/{{ site_domain }}/logs/access.log combined
+
+    <Directory /var/www/{{ site_domain }}/public_html>
+        Options -Indexes +FollowSymLinks
+        AllowOverride None
+        Require all granted
+    </Directory>
+</VirtualHost>

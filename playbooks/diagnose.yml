@@ -1,0 +1,76 @@
+---
+- name: Diagnosticar Apache sem alterar o servidor
+  hosts: all
+  gather_facts: true
+  become: false
+  tasks:
+    - name: Verificar se o pacote apache2 está instalado
+      ansible.builtin.command:
+        argv: [dpkg-query, -W, "-f=${Status}\n${Version}", apache2]
+      register: apache_package
+      changed_when: false
+      failed_when: false
+
+    - name: Interpretar o estado do pacote Apache
+      ansible.builtin.set_fact:
+        apache_installed: >-
+          {{ apache_package.rc == 0 and
+             (apache_package.stdout_lines | default([]) | first | default('')) == 'install ok installed' }}
+
+    - name: Consultar o estado do serviço Apache
+      ansible.builtin.command:
+        argv: [systemctl, is-active, apache2]
+      register: apache_active
+      changed_when: false
+      failed_when: false
+      when: apache_installed
+
+    - name: Consultar habilitação do Apache no boot
+      ansible.builtin.command:
+        argv: [systemctl, is-enabled, apache2]
+      register: apache_enabled
+      changed_when: false
+      failed_when: false
+      when: apache_installed
+
+    - name: Consultar processos escutando na porta TCP 80
+      ansible.builtin.command:
+        argv: [ss, -ltnp, "sport = :80"]
+      register: port_80
+      changed_when: false
+      failed_when: false
+
+    - name: Testar a sintaxe da configuração do Apache
+      ansible.builtin.command:
+        argv: [apache2ctl, configtest]
+      register: apache_configtest
+      changed_when: false
+      failed_when: false
+      when: apache_installed
+
+    - name: Listar Virtual Hosts habilitados
+      ansible.builtin.find:
+        paths: /etc/apache2/sites-enabled
+        file_type: any
+        recurse: false
+      register: enabled_sites
+      failed_when: false
+      when: apache_installed
+
+    - name: Exibir relatório do servidor
+      ansible.builtin.debug:
+        msg: |-
+          ============================================================
+          Servidor: {{ inventory_hostname }} ({{ ansible_host | default(inventory_hostname) }})
+          Linux: {{ ansible_distribution }} {{ ansible_distribution_version }}
+          Conectividade Ansible/SSH: OK
+          Apache2 instalado: {{ 'sim' if apache_installed else 'não' }}
+          Versão do Apache: {{ (apache_package.stdout_lines | default([]) | last) if apache_installed else 'não se aplica' }}
+          Estado do serviço: {{ apache_active.stdout | default('não se aplica') }}
+          Habilitado no boot: {{ apache_enabled.stdout | default('não se aplica') }}
+          Porta TCP 80: {{ 'em uso' if (port_80.stdout_lines | default([]) | length) > 1 else 'livre' }}
+          Processo/saída da porta 80: {{ (port_80.stdout_lines | default([]) | reject('match', '^State') | list | join(' | ')) or 'nenhum identificado (detalhes podem exigir privilégios)' }}
+          Teste de sintaxe: {{ ((apache_configtest.stdout | default('')) ~ ' ' ~ (apache_configtest.stderr | default(''))) | trim if apache_installed else 'não se aplica' }}
+          Virtual Hosts habilitados: {{ (enabled_sites.files | default([]) | map(attribute='path') | map('basename') | list | join(', ')) or ('nenhum' if apache_installed else 'não se aplica') }}
+          ============================================================
+

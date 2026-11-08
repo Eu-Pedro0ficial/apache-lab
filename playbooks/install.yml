@@ -1,0 +1,177 @@
+---
+- name: Instalar Apache com verificação segura da porta HTTP
+  hosts: all
+  gather_facts: false
+  any_errors_fatal: false
+  vars:
+    install_status: "não executada"
+    install_error: "nenhum"
+    apache_installed: false
+    apache_was_installed: false
+    install_succeeded: false
+
+  tasks:
+    - name: Executar pré-verificações e instalação por servidor
+      block:
+        - name: Verificar conectividade SSH e disponibilidade do Ansible
+          ansible.builtin.wait_for_connection:
+            timeout: 15
+
+        - name: Coletar informações do sistema
+          ansible.builtin.setup:
+
+        - name: Validar sistema operacional compatível
+          ansible.builtin.assert:
+            that:
+              - ansible_facts.os_family == 'Debian'
+              - ansible_facts.distribution in ['Ubuntu', 'Debian']
+            fail_msg: >-
+              Sistema incompatível: {{ ansible_facts.distribution | default('desconhecido') }}
+              {{ ansible_facts.distribution_version | default('') }}. Somente Ubuntu/Debian é suportado.
+
+        - name: Verificar privilégios para instalação
+          ansible.builtin.command: /usr/bin/true
+          become: true
+          changed_when: false
+
+        - name: Verificar se o Apache2 já está instalado
+          ansible.builtin.command:
+            argv: [dpkg-query, -W, "-f=${Status}\n${Version}", apache2]
+          register: apache_package_before
+          changed_when: false
+          failed_when: false
+
+        - name: Registrar estado inicial do Apache
+          ansible.builtin.set_fact:
+            apache_was_installed: >-
+              {{ apache_package_before.rc == 0 and
+                 (apache_package_before.stdout_lines | default([]) | first | default('')) ==
+                 'install ok installed' }}
+            apache_installed: >-
+              {{ apache_package_before.rc == 0 and
+                 (apache_package_before.stdout_lines | default([]) | first | default('')) ==
+                 'install ok installed' }}
+
+        - name: Inspecionar a porta TCP 80 com privilégios
+          ansible.builtin.command:
+            argv: [ss, -H, -ltnp, "sport = :80"]
+          become: true
+          register: port_80_before
+          changed_when: false
+          failed_when: port_80_before.rc != 0
+
+        - name: Identificar a situação da porta TCP 80
+          ansible.builtin.set_fact:
+            port_80_in_use: "{{ (port_80_before.stdout | trim | length) > 0 }}"
+            port_80_owned_by_apache: >-
+              {{ (port_80_before.stdout | trim | length) > 0 and
+                 ('apache2' in port_80_before.stdout) }}
+
+        - name: Bloquear conflito ou ocupação não identificada na porta 80
+          ansible.builtin.assert:
+            that:
+              - not port_80_in_use or (apache_was_installed and port_80_owned_by_apache)
+            fail_msg: >-
+              Porta TCP 80 ocupada por processo diferente do Apache2 ou não identificado com segurança.
+              Nenhuma instalação ou alteração de serviço foi realizada.
+              Detalhes: {{ port_80_before.stdout | default('sem detalhes') | trim }}
+
+        - name: Instalar Apache2 sem iniciar automaticamente pelo gerenciador de pacotes
+          ansible.builtin.apt:
+            name: apache2
+            state: present
+            update_cache: true
+            cache_valid_time: 3600
+            policy_rc_d: 101
+          become: true
+          register: apache_install
+          when: not apache_was_installed
+
+        - name: Registrar Apache como instalado
+          ansible.builtin.set_fact:
+            apache_installed: true
+
+        - name: Validar configuração antes de iniciar o Apache
+          ansible.builtin.command:
+            argv: [apache2ctl, configtest]
+          become: true
+          register: configtest_before_start
+          changed_when: false
+          failed_when: false
+
+        - name: Bloquear inicialização quando a configuração for inválida
+          ansible.builtin.assert:
+            that: configtest_before_start.rc == 0
+            fail_msg: >-
+              Configuração Apache inválida; o serviço não será iniciado.
+              {{ configtest_before_start.stderr | default(configtest_before_start.stdout) }}
+
+        - name: Garantir Apache iniciado e habilitado no boot
+          ansible.builtin.systemd_service:
+            name: apache2
+            state: started
+            enabled: true
+          become: true
+
+        - name: Registrar sucesso da operação
+          ansible.builtin.set_fact:
+            install_succeeded: true
+            install_status: >-
+              {{ 'Apache2 já estava instalado; estado seguro confirmado'
+                 if apache_was_installed
+                 else 'Apache2 instalado com sucesso' }}
+
+      rescue:
+        - name: Registrar falha sem interromper os demais servidores
+          ansible.builtin.set_fact:
+            install_status: "bloqueada ou malsucedida"
+            install_error: >-
+              {{ ansible_failed_result.msg
+                 | default(ansible_failed_result.stderr)
+                 | default('erro não identificado') }}
+
+      always:
+        - name: Consultar versão final do Apache
+          ansible.builtin.command:
+            argv: [dpkg-query, -W, "-f=${Version}", apache2]
+          register: apache_version_final
+          changed_when: false
+          failed_when: false
+
+        - name: Consultar estado final do serviço Apache
+          ansible.builtin.command:
+            argv: [systemctl, is-active, apache2]
+          register: apache_service_final
+          changed_when: false
+          failed_when: false
+
+        - name: Consultar resultado final da configuração
+          ansible.builtin.command:
+            argv: [apache2ctl, configtest]
+          register: apache_config_final
+          changed_when: false
+          failed_when: false
+          when: apache_version_final.rc == 0
+
+        - name: Consultar portas finais utilizadas pelo Apache
+          ansible.builtin.command:
+            argv: [ss, -H, -ltnp]
+          become: true
+          register: apache_ports_final
+          changed_when: false
+          failed_when: false
+          when: install_succeeded
+
+        - name: Exibir relatório final do servidor
+          ansible.builtin.debug:
+            msg: |-
+              ============================================================
+              Servidor: {{ inventory_hostname }} ({{ ansible_host | default(inventory_hostname) }})
+              Status da instalação: {{ install_status }}
+              Versão do Apache: {{ apache_version_final.stdout | default('não instalado') if apache_version_final.rc == 0 else 'não instalado' }}
+              Estado do serviço: {{ apache_service_final.stdout | default('indisponível') }}
+              Teste de configuração: {{ ((apache_config_final.stdout | default('')) ~ ' ' ~ (apache_config_final.stderr | default(''))) | trim if apache_version_final.rc == 0 else 'não se aplica' }}
+              Porta(s) HTTP utilizada(s) pelo Apache: {{ (apache_ports_final.stdout_lines | default([]) | select('search', 'apache2') | list | join(' | ')) or ('nenhuma identificada' if install_succeeded else 'não se aplica') }}
+              Ocupação detectada antes da operação: {{ port_80_before.stdout | default('não foi possível verificar') | trim or 'porta livre' }}
+              Erros: {{ install_error }}
+              ============================================================

@@ -1,0 +1,538 @@
+---
+- name: Publicar site Apache com validação e rollback
+  hosts: all
+  gather_facts: false
+  any_errors_fatal: false
+  vars:
+    document_root: "/var/www/{{ site_domain }}/public_html"
+    logs_directory: "/var/www/{{ site_domain }}/logs"
+    vhost_path: "/etc/apache2/sites-available/{{ site_domain }}.conf"
+    enabled_vhost_path: "/etc/apache2/sites-enabled/{{ site_domain }}.conf"
+    listen_config_path: "/etc/apache2/conf-available/apache-lab-listen-{{ site_port }}.conf"
+    listen_enabled_path: "/etc/apache2/conf-enabled/apache-lab-listen-{{ site_port }}.conf"
+    validation_filename: ".apache-lab-manager-check"
+    validation_marker: "apache-lab-manager:{{ site_domain }}:{{ site_port }}"
+    publication_status: "não executada"
+    publication_error: "nenhum"
+    configtest_result: "não executado"
+    http_result: "não executado"
+    apache_state: "desconhecido"
+    deployment_changed: false
+    rollback_required: false
+    listen_rollback_required: false
+
+  tasks:
+    - name: Validar variáveis recebidas da CLI
+      ansible.builtin.assert:
+        that:
+          - site_domain is match('^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$')
+          - "'..' not in site_domain"
+          - "'/' not in site_domain"
+          - site_alias | length == 0 or site_alias is match('^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$')
+          - admin_email | length == 0 or admin_email is match('^[A-Za-z0-9.!#$%&''*+/=?^_`{|}~-]+@([A-Za-z0-9-]+\\.)+[A-Za-z0-9-]+$')
+          - site_title | length > 0
+          - site_title | length <= 120
+          - site_port | int >= 1
+          - site_port | int <= 65535
+          - (site_port | string) is match('^[0-9]+$')
+          - allow_existing_vhost | type_debug == 'bool'
+          - allow_port_change | type_debug == 'bool'
+        fail_msg: "Parâmetros de publicação inválidos; nenhuma alteração foi realizada."
+
+    - name: Publicar site por servidor
+      block:
+        - name: Verificar conectividade
+          ansible.builtin.wait_for_connection:
+            timeout: 15
+
+        - name: Verificar se Apache2 está instalado
+          ansible.builtin.command:
+            argv: [dpkg-query, -W, "-f=${Status}", apache2]
+          register: apache_package
+          changed_when: false
+          failed_when: false
+
+        - name: Exigir Apache2 instalado
+          ansible.builtin.assert:
+            that:
+              - apache_package.rc == 0
+              - apache_package.stdout == 'install ok installed'
+            fail_msg: "Apache2 não está instalado. Execute primeiro a opção 2."
+
+        - name: Verificar privilégios administrativos
+          ansible.builtin.command: /usr/bin/true
+          become: true
+          changed_when: false
+
+        - name: Consultar estado atual do Apache
+          ansible.builtin.command:
+            argv: [systemctl, is-active, apache2]
+          register: apache_state_before
+          changed_when: false
+          failed_when: false
+
+        - name: Exigir Apache em execução
+          ansible.builtin.assert:
+            that: apache_state_before.stdout == 'active'
+            fail_msg: "Apache não está ativo; a publicação foi bloqueada."
+
+        - name: Inspecionar processo local na porta selecionada
+          ansible.builtin.command:
+            argv: [ss, -H, -ltnp, "sport = :{{ site_port }}"]
+          become: true
+          register: selected_port_socket
+          changed_when: false
+          failed_when: selected_port_socket.rc != 0
+
+        - name: Bloquear processo diferente do Apache na porta selecionada
+          ansible.builtin.assert:
+            that:
+              - selected_port_socket.stdout | trim | length == 0 or 'apache2' in selected_port_socket.stdout
+            fail_msg: >-
+              A porta {{ site_port }} está ocupada por processo diferente do Apache ou não
+              identificável com segurança: {{ selected_port_socket.stdout | default('sem detalhes') }}.
+              Nenhum processo será interrompido.
+
+        - name: Consultar regras NAT via iptables
+          ansible.builtin.command:
+            argv: [iptables-save, -t, nat]
+          become: true
+          register: iptables_nat
+          changed_when: false
+          failed_when: false
+
+        - name: Consultar regras NAT via nftables
+          ansible.builtin.command:
+            argv: [nft, list, ruleset]
+          become: true
+          register: nft_ruleset
+          changed_when: false
+          failed_when: false
+
+        - name: Exigir visibilidade suficiente das regras NAT
+          ansible.builtin.assert:
+            that: iptables_nat.rc == 0 or nft_ruleset.rc == 0
+            fail_msg: >-
+              Não foi possível inspecionar iptables nem nftables; a segurança da porta
+              {{ site_port }} não pode ser determinada. Publicação bloqueada neste host.
+
+        - name: Detectar redirecionamento NAT ou HostPort conhecido
+          ansible.builtin.set_fact:
+            nat_port_conflict: >-
+              {{ ((iptables_nat.stdout | default('')) ~ '\n' ~ (nft_ruleset.stdout | default('')))
+                 is regex('(?im)(?:dpt:|dport\\s+|redirect\\s+to\\s+:?|to:)[^\\n]*\\b' ~
+                          (site_port | string) ~ '\\b') }}
+
+        - name: Bloquear conflito NAT conhecido
+          ansible.builtin.assert:
+            that: not nat_port_conflict
+            fail_msg: >-
+              A porta {{ site_port }} aparece em regras NAT/HostPort locais, possivelmente
+              Kubernetes, K3s ou Traefik. Nenhuma regra ou serviço foi modificado.
+
+        - name: Ler configuração principal de portas do Apache
+          ansible.builtin.slurp:
+            src: /etc/apache2/ports.conf
+          become: true
+          register: apache_ports_config
+
+        - name: Localizar configurações adicionais ativas do Apache
+          ansible.builtin.find:
+            paths: /etc/apache2/conf-enabled
+            patterns: "*.conf"
+            file_type: any
+            recurse: true
+          become: true
+          register: enabled_apache_configs
+
+        - name: Ler configurações adicionais ativas
+          ansible.builtin.slurp:
+            src: "{{ item.path }}"
+          become: true
+          loop: "{{ enabled_apache_configs.files }}"
+          register: enabled_apache_config_contents
+          loop_control:
+            label: "{{ item.path }}"
+
+        - name: Identificar Listen ativo para a porta selecionada
+          ansible.builtin.set_fact:
+            listen_already_active: >-
+              {{ ('apache2' in selected_port_socket.stdout) or
+                 ((apache_ports_config.content | b64decode) is regex(
+                   '(?im)^\\s*Listen\\s+(?:\\[[^]]+\\]:|[^:\\s]+:)?' ~
+                   (site_port | string) ~ '(?:\\s+\\w+)?\\s*$')) }}
+
+        - name: Identificar Listen em configurações adicionais
+          ansible.builtin.set_fact:
+            listen_already_active: true
+          vars:
+            decoded_apache_config: "{{ item.content | b64decode }}"
+            listen_pattern: >-
+              (?im)^\s*Listen\s+(?:\[[^]]+\]:|[^:\s]+:)?{{ site_port }}(?:\s+\w+)?\s*$
+          when: decoded_apache_config is regex(listen_pattern)
+          loop: "{{ enabled_apache_config_contents.results }}"
+          loop_control:
+            label: "{{ item.source }}"
+
+        - name: Localizar Virtual Hosts disponíveis
+          ansible.builtin.find:
+            paths: /etc/apache2/sites-available
+            patterns: "*.conf"
+            file_type: file
+          become: true
+          register: available_vhosts
+
+        - name: Ler Virtual Hosts disponíveis
+          ansible.builtin.slurp:
+            src: "{{ item.path }}"
+          become: true
+          loop: "{{ available_vhosts.files }}"
+          register: available_vhost_contents
+          loop_control:
+            label: "{{ item.path }}"
+
+        - name: Inicializar lista de conflitos
+          ansible.builtin.set_fact:
+            conflicting_vhosts: []
+
+        - name: Detectar ServerName ou ServerAlias conflitante
+          ansible.builtin.set_fact:
+            conflicting_vhosts: "{{ conflicting_vhosts + [item.source] }}"
+          vars:
+            decoded_vhost: "{{ item.content | b64decode }}"
+            domain_pattern: >-
+              (?im)^\s*Server(?:Name|Alias)\s+[^#\n]*(?:^|\s){{ site_domain | regex_escape }}(?:\s|$)
+            alias_pattern: >-
+              (?im)^\s*Server(?:Name|Alias)\s+[^#\n]*(?:^|\s){{ site_alias | regex_escape }}(?:\s|$)
+          when:
+            - item.source != vhost_path
+            - decoded_vhost is regex(domain_pattern) or (site_alias | length > 0 and decoded_vhost is regex(alias_pattern))
+          loop: "{{ available_vhost_contents.results }}"
+          loop_control:
+            label: "{{ item.source }}"
+
+        - name: Bloquear conflitos com outros Virtual Hosts
+          ansible.builtin.assert:
+            that: conflicting_vhosts | length == 0
+            fail_msg: >-
+              ServerName/ServerAlias já utilizado em: {{ conflicting_vhosts | join(', ') }}.
+              Nenhuma alteração foi realizada.
+
+        - name: Verificar configuração de destino existente
+          ansible.builtin.stat:
+            path: "{{ vhost_path }}"
+          become: true
+          register: vhost_before
+
+        - name: Ler configuração de destino existente
+          ansible.builtin.slurp:
+            src: "{{ vhost_path }}"
+          become: true
+          register: existing_vhost_content
+          when: vhost_before.stat.exists
+
+        - name: Identificar portas da configuração existente
+          ansible.builtin.set_fact:
+            existing_vhost_ports: >-
+              {{ (existing_vhost_content.content | b64decode
+                  | regex_findall('(?im)<VirtualHost[^>]*:([0-9]+)[^>]*>')
+                  | map('int') | unique | list)
+                 if vhost_before.stat.exists else [] }}
+
+        - name: Exigir confirmação para alterar porta do domínio
+          ansible.builtin.assert:
+            that: >-
+              existing_vhost_ports | length == 0 or
+              existing_vhost_ports | difference([site_port | int]) | length == 0 or
+              allow_port_change
+            fail_msg: >-
+              O domínio já está publicado na(s) porta(s)
+              {{ existing_vhost_ports | join(', ') }}. Confirmação explícita é necessária
+              para alterar sua configuração para a porta {{ site_port }}.
+
+        - name: Bloquear sobrescrita sem autorização explícita
+          ansible.builtin.assert:
+            that: not vhost_before.stat.exists or allow_existing_vhost
+            fail_msg: >-
+              {{ vhost_path }} já existe. Execute novamente e autorize explicitamente
+              a atualização com backup e rollback.
+
+        - name: Verificar ativação anterior do Virtual Host
+          ansible.builtin.stat:
+            path: "{{ enabled_vhost_path }}"
+          become: true
+          register: enabled_before
+
+        - name: Verificar arquivo Listen gerenciado anterior
+          ansible.builtin.stat:
+            path: "{{ listen_config_path }}"
+          become: true
+          register: listen_config_before
+
+        - name: Verificar ativação anterior do Listen gerenciado
+          ansible.builtin.stat:
+            path: "{{ listen_enabled_path }}"
+          become: true
+          register: listen_enabled_before
+
+        - name: Criar arquivo Listen isolado quando necessário
+          ansible.builtin.copy:
+            content: "Listen {{ site_port }}\n"
+            dest: "{{ listen_config_path }}"
+            owner: root
+            group: root
+            mode: "0644"
+            backup: true
+          become: true
+          register: listen_config_write
+          when: not listen_already_active
+
+        - name: Habilitar arquivo Listen gerenciado quando necessário
+          ansible.builtin.file:
+            src: "{{ listen_config_path }}"
+            dest: "{{ listen_enabled_path }}"
+            state: link
+          become: true
+          register: listen_enable
+          when: not listen_already_active
+
+        - name: Registrar alterações da diretiva Listen
+          ansible.builtin.set_fact:
+            listen_rollback_required: >-
+              {{ (listen_config_write.changed | default(false)) or
+                 (listen_enable.changed | default(false)) }}
+
+        - name: Criar estrutura do site
+          ansible.builtin.file:
+            path: "{{ item.path }}"
+            state: directory
+            owner: root
+            group: "{{ item.group }}"
+            mode: "{{ item.mode }}"
+          become: true
+          loop:
+            - {path: "/var/www/{{ site_domain }}", group: root, mode: "0755"}
+            - {path: "{{ document_root }}", group: root, mode: "0755"}
+            - {path: "{{ logs_directory }}", group: adm, mode: "0750"}
+
+        - name: Criar página demonstrativa sem sobrescrever personalizações
+          ansible.builtin.template:
+            src: "{{ playbook_dir }}/../templates/site-index.html.j2"
+            dest: "{{ document_root }}/index.html"
+            owner: root
+            group: root
+            mode: "0644"
+            force: false
+          become: true
+
+        - name: Criar marcador para validação HTTP
+          ansible.builtin.copy:
+            content: "{{ validation_marker }}\n"
+            dest: "{{ document_root }}/{{ validation_filename }}"
+            owner: root
+            group: root
+            mode: "0644"
+          become: true
+
+        - name: Escrever configuração do Virtual Host com backup
+          ansible.builtin.template:
+            src: "{{ playbook_dir }}/../templates/vhost.conf.j2"
+            dest: "{{ vhost_path }}"
+            owner: root
+            group: root
+            mode: "0644"
+            backup: true
+          become: true
+          register: vhost_template
+
+        - name: Registrar necessidade potencial de rollback
+          ansible.builtin.set_fact:
+            rollback_required: "{{ vhost_template.changed }}"
+
+        - name: Ativar Virtual Host de forma idempotente
+          ansible.builtin.file:
+            src: "{{ vhost_path }}"
+            dest: "{{ enabled_vhost_path }}"
+            state: link
+          become: true
+          register: vhost_enable
+
+        - name: Atualizar necessidade de reload e rollback
+          ansible.builtin.set_fact:
+            deployment_changed: >-
+              {{ vhost_template.changed or vhost_enable.changed or listen_rollback_required }}
+            rollback_required: "{{ vhost_template.changed or vhost_enable.changed }}"
+
+        - name: Validar configuração completa do Apache
+          ansible.builtin.command:
+            argv: [apache2ctl, configtest]
+          become: true
+          register: configtest
+          changed_when: false
+          failed_when: false
+
+        - name: Bloquear reload quando configuração for inválida
+          ansible.builtin.assert:
+            that: configtest.rc == 0
+            fail_msg: >-
+              Configuração Apache inválida: {{ configtest.stderr | default(configtest.stdout) }}
+
+        - name: Recarregar somente o Apache quando necessário
+          ansible.builtin.systemd_service:
+            name: apache2
+            state: reloaded
+          become: true
+          when: deployment_changed
+
+        - name: Validar publicação local com Host header
+          ansible.builtin.uri:
+            url: "http://127.0.0.1:{{ site_port }}/{{ validation_filename }}"
+            headers:
+              Host: "{{ site_domain }}"
+            return_content: true
+            status_code: 200
+          register: http_check
+
+        - name: Confirmar que a resposta pertence ao site publicado
+          ansible.builtin.assert:
+            that:
+              - http_check.status == 200
+              - validation_marker in http_check.content
+            fail_msg: "HTTP respondeu, mas o conteúdo não corresponde ao Virtual Host publicado."
+
+        - name: Registrar publicação bem-sucedida
+          ansible.builtin.set_fact:
+            publication_status: "publicado com sucesso"
+            configtest_result: "{{ (configtest.stdout ~ ' ' ~ configtest.stderr) | trim }}"
+            http_result: "HTTP {{ http_check.status }}; porta {{ site_port }}; Host header e conteúdo validados"
+            rollback_required: false
+            listen_rollback_required: false
+
+      rescue:
+        - name: Restaurar configuração anterior a partir do backup
+          ansible.builtin.copy:
+            src: "{{ vhost_template.backup_file }}"
+            dest: "{{ vhost_path }}"
+            remote_src: true
+            owner: root
+            group: root
+            mode: "0644"
+          become: true
+          when:
+            - rollback_required | default(false)
+            - vhost_before is defined
+            - vhost_before.stat.exists | default(false)
+            - vhost_template.backup_file is defined
+
+        - name: Remover nova configuração durante rollback
+          ansible.builtin.file:
+            path: "{{ vhost_path }}"
+            state: absent
+          become: true
+          when:
+            - rollback_required | default(false)
+            - vhost_before is defined
+            - not (vhost_before.stat.exists | default(false))
+
+        - name: Restaurar estado desativado anterior
+          ansible.builtin.file:
+            path: "{{ enabled_vhost_path }}"
+            state: absent
+          become: true
+          when:
+            - rollback_required | default(false)
+            - enabled_before is defined
+            - not (enabled_before.stat.exists | default(false))
+
+        - name: Restaurar arquivo Listen gerenciado anterior
+          ansible.builtin.copy:
+            src: "{{ listen_config_write.backup_file }}"
+            dest: "{{ listen_config_path }}"
+            remote_src: true
+            owner: root
+            group: root
+            mode: "0644"
+          become: true
+          when:
+            - listen_rollback_required | default(false)
+            - listen_config_before is defined
+            - listen_config_before.stat.exists | default(false)
+            - listen_config_write.backup_file is defined
+
+        - name: Remover novo arquivo Listen durante rollback
+          ansible.builtin.file:
+            path: "{{ listen_config_path }}"
+            state: absent
+          become: true
+          when:
+            - listen_rollback_required | default(false)
+            - listen_config_before is defined
+            - not (listen_config_before.stat.exists | default(false))
+
+        - name: Restaurar estado desativado anterior do Listen
+          ansible.builtin.file:
+            path: "{{ listen_enabled_path }}"
+            state: absent
+          become: true
+          when:
+            - listen_rollback_required | default(false)
+            - listen_enabled_before is defined
+            - not (listen_enabled_before.stat.exists | default(false))
+
+        - name: Validar configuração restaurada
+          ansible.builtin.command:
+            argv: [apache2ctl, configtest]
+          become: true
+          register: rollback_configtest
+          changed_when: false
+          failed_when: false
+          when: (rollback_required | default(false)) or (listen_rollback_required | default(false))
+
+        - name: Recarregar Apache após rollback válido
+          ansible.builtin.systemd_service:
+            name: apache2
+            state: reloaded
+          become: true
+          when:
+            - (rollback_required | default(false)) or (listen_rollback_required | default(false))
+            - rollback_configtest.rc | default(1) == 0
+
+        - name: Registrar falha da publicação
+          ansible.builtin.set_fact:
+            publication_status: "bloqueada ou revertida"
+            publication_error: >-
+              {{ ansible_failed_result.msg
+                 | default(ansible_failed_result.stderr)
+                 | default('erro não identificado') }}
+            configtest_result: >-
+              {{ ((configtest.stdout | default('')) ~ ' ' ~ (configtest.stderr | default(''))) | trim
+                 or 'não concluído' }}
+            http_result: >-
+              {{ ('HTTP ' ~ (http_check.status | string))
+                 if http_check is defined and http_check.status is defined
+                 else 'não concluído' }}
+
+      always:
+        - name: Consultar estado final do Apache
+          ansible.builtin.command:
+            argv: [systemctl, is-active, apache2]
+          register: apache_state_final
+          changed_when: false
+          failed_when: false
+
+        - name: Exibir relatório da publicação
+          ansible.builtin.debug:
+            msg: |-
+              ============================================================
+              Servidor: {{ inventory_hostname }} ({{ ansible_host | default(inventory_hostname) }})
+              Status da publicação: {{ publication_status }}
+              Domínio: {{ site_domain }}
+              Porta HTTP: {{ site_port }}
+              DocumentRoot: {{ document_root }}
+              Configuração: {{ vhost_path }}
+              Listen: {{ 'diretiva ativa reutilizada' if listen_already_active | default(false) else listen_config_path }}
+              Configtest: {{ configtest_result }}
+              Teste HTTP: {{ http_result }}
+              Estado do Apache: {{ apache_state_final.stdout | default('indisponível') }}
+              Erros: {{ publication_error }}
+              ============================================================

@@ -1,0 +1,12 @@
+# Inventário real e possíveis artefatos locais
+inventory/hosts.yml
+inventory/*.retry
+*.retry
+.venv/
+
+# Chaves e segredos nunca devem fazer parte deste repositório
+*.pem
+*.key
+id_rsa*
+id_ed25519*
+

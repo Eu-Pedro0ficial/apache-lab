@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ site_title | e }}</title>
+  <style>
+    :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+    body { min-height: 100vh; margin: 0; display: grid; place-items: center; background: #172033; color: #f5f7fb; }
+    main { width: min(42rem, calc(100% - 3rem)); padding: 2.5rem; border: 1px solid #43506a; border-radius: 1rem; background: #222d43; box-shadow: 0 1rem 3rem #0b102080; }
+    .status { color: #73e2a7; font-weight: 700; letter-spacing: .03em; }
+    h1 { margin: .5rem 0; font-size: clamp(2rem, 7vw, 4rem); overflow-wrap: anywhere; }
+    p { line-height: 1.6; }
+    footer { margin-top: 2rem; color: #b8c1d6; font-size: .9rem; }
+  </style>
+</head>
+<body>
+  <main>
+    <p class="status">Apache configurado com sucesso</p>
+    <h1>{{ site_domain | e }}</h1>
+    <p>{{ site_title | e }}</p>
+    <footer>Apache Lab Manager &middot; Ambiente de laboratório</footer>
+  </main>
+</body>
+</html>
