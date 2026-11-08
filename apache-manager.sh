@@ -7,6 +7,7 @@ readonly INVENTORY_FILE="${INVENTORY_DIR}/hosts.yml"
 readonly DIAGNOSE_PLAYBOOK="${SCRIPT_DIR}/playbooks/diagnose.yml"
 readonly INSTALL_PLAYBOOK="${SCRIPT_DIR}/playbooks/install.yml"
 readonly DEPLOY_PLAYBOOK="${SCRIPT_DIR}/playbooks/deploy-site.yml"
+readonly TEARDOWN_PLAYBOOK="${SCRIPT_DIR}/playbooks/teardown.yml"
 readonly VENV_BIN="${SCRIPT_DIR}/.venv/bin"
 
 ANSIBLE_COMMAND=""
@@ -405,6 +406,104 @@ deploy_site() {
   fi
 }
 
+confirm_destroy() {
+  local confirmation
+  read -r -p 'Digite DESTRUIR para confirmar: ' confirmation
+  [[ "$confirmation" == "DESTRUIR" ]]
+}
+
+execute_teardown() {
+  local operation="$1"
+  local site_domain="${2:-}"
+  local delete_content="${3:-false}"
+  local allow_legacy="${4:-false}"
+  local phase extra_vars_file teardown_failed=false
+  local -a playbook_options=()
+
+  select_hosts || return
+  if selected_hosts_require_become && ask_yes_no 'Solicitar senha de sudo/become ao executar? [s/N] ' n; then
+    playbook_options+=(--ask-become-pass)
+  fi
+
+  extra_vars_file="$(mktemp "${TMPDIR:-/tmp}/apache-lab-teardown.XXXXXX.json")"
+  chmod 600 "$extra_vars_file"
+  for phase in plan apply; do
+    printf '{"teardown_operation":"%s","teardown_phase":"%s","site_domain":"%s","delete_site_content":%s,"allow_legacy":%s}\n' \
+      "$operation" "$phase" "$(json_escape "$site_domain")" "$delete_content" "$allow_legacy" >"$extra_vars_file"
+
+    if [[ "$phase" == "plan" ]]; then
+      printf '\nPlano de teardown (somente leitura):\n\n'
+    else
+      printf '\nExecutando teardown confirmado...\n\n'
+    fi
+
+    if ! "$ANSIBLE_PLAYBOOK_COMMAND" -i "$INVENTORY_FILE" "$TEARDOWN_PLAYBOOK" \
+      --limit "$SELECTED_LIMIT" --extra-vars "@${extra_vars_file}" "${playbook_options[@]}"; then
+      teardown_failed=true
+      [[ "$phase" == "plan" ]] && break
+    fi
+
+    if [[ "$phase" == "plan" ]]; then
+      printf '\nServidores afetados:\n  - %s\n' "${SELECTED_LIMIT//,/$'\n  - '}"
+      case "$operation" in
+        site) printf 'Site solicitado: %s\nRemover conteúdo: %s\n' "$site_domain" "$delete_content" ;;
+        all) printf 'Operação: remover todos os sites comprovadamente gerenciados\nRemover conteúdo: %s\n' "$delete_content" ;;
+        uninstall) printf 'Operação: remover sites gerenciados, parar Apache e purgar pacotes Apache2\n' ;;
+      esac
+      printf 'Inventário, K3s, Traefik, n8n, firewall, DNS e outros serviços serão preservados.\n'
+      if ! confirm_destroy; then
+        printf 'Teardown cancelado; nenhum recurso foi alterado.\n'
+        break
+      fi
+    fi
+  done
+  unlink "$extra_vars_file"
+
+  if [[ "$teardown_failed" == true ]]; then
+    printf '\nO teardown encontrou bloqueios ou falhas. Confira os relatórios por servidor.\n' >&2
+  fi
+}
+
+teardown_menu() {
+  local option site_domain delete_content allow_legacy
+  while true; do
+    printf '\nDestruir / Remover ambiente Apache\n'
+    printf '1 - Remover um site específico\n2 - Remover todos os sites gerenciados\n3 - Desinstalar completamente o Apache\n0 - Voltar\n'
+    read -r -p 'Opção: ' option
+    case "$option" in
+      1)
+        while true; do
+          read -r -p 'Domínio do site a remover: ' site_domain
+          site_domain="${site_domain,,}"
+          valid_domain "$site_domain" && break
+          printf 'Domínio inválido.\n'
+        done
+        delete_content=false
+        allow_legacy=false
+        ask_yes_no 'Excluir também todo o conteúdo e logs do site? [s/N] ' n && delete_content=true
+        ask_yes_no 'Autorizar remoção se for comprovado como site legado do Apache Lab Manager? [s/N] ' n && allow_legacy=true
+        execute_teardown site "$site_domain" "$delete_content" "$allow_legacy"
+        pause
+        ;;
+      2)
+        delete_content=false
+        ask_yes_no 'Excluir também conteúdo e logs de todos os sites gerenciados? [s/N] ' n && delete_content=true
+        execute_teardown all '' "$delete_content" false
+        pause
+        ;;
+      3)
+        allow_legacy=false
+        printf 'A desinstalação será bloqueada se houver Virtual Hosts não gerenciados.\n'
+        ask_yes_no 'Incluir sites legados comprovados do Apache Lab Manager? [s/N] ' n && allow_legacy=true
+        execute_teardown uninstall '' true "$allow_legacy"
+        pause
+        ;;
+      0) return ;;
+      *) printf 'Opção inválida.\n' ;;
+    esac
+  done
+}
+
 manage_servers() {
   local option
   while true; do
@@ -440,13 +539,14 @@ main_menu() {
   local option
   while true; do
     printf '\nApache Lab Manager\n'
-    printf '1 - Diagnosticar Apache\n2 - Instalar Apache\n3 - Publicar novo site\n4 - Gerenciar servidores\n0 - Sair\n'
+    printf '1 - Diagnosticar Apache\n2 - Instalar Apache\n3 - Publicar novo site\n4 - Gerenciar servidores\n5 - Destruir / Remover ambiente Apache\n0 - Sair\n'
     read -r -p 'Opção: ' option
     case "$option" in
       1) diagnose_apache; pause ;;
       2) install_apache; pause ;;
       3) deploy_site; pause ;;
       4) manage_servers ;;
+      5) teardown_menu ;;
       0) printf 'Até logo!\n'; return ;;
       *) printf 'Opção inválida.\n' ;;
     esac

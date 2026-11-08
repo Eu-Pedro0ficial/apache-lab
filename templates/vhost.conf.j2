@@ -1,3 +1,5 @@
+# Managed by Apache Lab Manager
+# Domain={{ site_domain }} Port={{ site_port }}
 <VirtualHost *:{{ site_port }}>
     ServerName {{ site_domain }}
 {% if site_alias | length > 0 %}

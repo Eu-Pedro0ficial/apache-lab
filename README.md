@@ -127,6 +127,37 @@ systemctl is-active apache2
 test ! -e /etc/apache2/conf-enabled/apache-lab-listen-PORTA.conf
 ```
 
+## Teardown seguro
+
+Escolha **5 - Destruir / Remover ambiente Apache**. As três operações executam primeiro uma descoberta somente de leitura, mostram o plano por servidor e exigem a palavra exata `DESTRUIR` antes da fase de aplicação:
+
+1. **Remover um site específico**: desabilita e remove somente o Virtual Host escolhido. O conteúdo em `/var/www/DOMINIO` somente é excluído após uma confirmação separada de perda de dados.
+2. **Remover todos os sites gerenciados**: remove somente configurações que contenham o marcador do Apache Lab Manager. Sites desconhecidos e legados não são incluídos automaticamente.
+3. **Desinstalar completamente o Apache**: bloqueia a operação diante de Virtual Hosts desconhecidos ou se a simulação do apt indicar remoção de pacotes fora de `apache2`, `apache2-bin`, `apache2-data` e `apache2-utils`. Não executa `autoremove`.
+
+Sites criados por versões anteriores são classificados como legados somente quando a configuração e o arquivo marcador no DocumentRoot comprovam sua origem. Mesmo assim, sua remoção precisa ser autorizada explicitamente. O inventário nunca é apagado.
+
+Para validar uma remoção de site:
+
+```bash
+test ! -e /etc/apache2/sites-enabled/cardoso.test.conf
+test ! -e /etc/apache2/sites-available/cardoso.test.conf
+sudo apache2ctl configtest
+sudo apache2ctl -S
+systemctl is-active apache2
+```
+
+Para validar uma desinstalação:
+
+```bash
+dpkg-query -W apache2
+systemctl is-active apache2
+test -d /var/www
+systemctl is-active k3s
+```
+
+Teste somente em VM descartável: publique dois sites gerenciados, adicione um Virtual Host de terceiro como sentinela e execute, separadamente, remoção individual, remoção de todos e desinstalação. Repita cada teardown para confirmar idempotência. A sentinela deve ser preservada e deve bloquear a desinstalação completa; K3s, Traefik, n8n e regras de rede devem permanecer inalterados.
+
 ## Funcionalidades
 
 Disponíveis nas etapas 1, 2 e 3:
@@ -139,6 +170,7 @@ Disponíveis nas etapas 1, 2 e 3:
 - relatório de instalação individual por servidor;
 - publicação idempotente de Virtual Hosts com detecção de conflitos e rollback;
 - validação HTTP local por `Host` header e relatório por servidor;
+- teardown planejado e confirmado de sites gerenciados e pacotes Apache;
 - retorno aos menus e tratamento de entradas inválidas.
 
 Planejadas para etapas futuras: HTTPS/Certbot, DNS e firewall (somente quando explicitamente projetados).
@@ -152,6 +184,7 @@ bash -n apache-manager.sh
 .venv/bin/ansible-playbook --syntax-check -i inventory/hosts.example.yml playbooks/diagnose.yml
 .venv/bin/ansible-playbook --syntax-check -i inventory/hosts.example.yml playbooks/install.yml
 .venv/bin/ansible-playbook --syntax-check -i inventory/hosts.example.yml playbooks/deploy-site.yml
+.venv/bin/ansible-playbook --syntax-check -i inventory/hosts.example.yml playbooks/teardown.yml
 .venv/bin/ansible-inventory -i inventory/hosts.example.yml --list
 ```
 

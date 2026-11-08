@@ -1,0 +1,451 @@
+---
+- name: Planejar ou executar teardown seguro do Apache Lab Manager
+  hosts: all
+  gather_facts: false
+  any_errors_fatal: false
+  vars:
+    managed_marker: "# Managed by Apache Lab Manager"
+    apache_packages:
+      - apache2
+      - apache2-bin
+      - apache2-data
+      - apache2-utils
+    teardown_status: "somente planejamento"
+    teardown_error: "nenhum"
+    removed_sites: []
+    removed_vhosts: []
+    removed_listens: []
+    packages_removed: []
+
+  tasks:
+    - name: Validar parâmetros do teardown
+      ansible.builtin.assert:
+        that:
+          - teardown_operation in ['site', 'all', 'uninstall']
+          - teardown_phase in ['plan', 'apply']
+          - teardown_operation != 'site' or site_domain is match('^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$')
+          - delete_site_content | type_debug == 'bool'
+          - allow_legacy | type_debug == 'bool'
+        fail_msg: "Parâmetros de teardown inválidos."
+
+    - name: Descobrir recursos e executar por servidor
+      block:
+        - name: Verificar conectividade
+          ansible.builtin.wait_for_connection:
+            timeout: 15
+
+        - name: Verificar se Apache2 está instalado
+          ansible.builtin.command:
+            argv: [dpkg-query, -W, "-f=${Status}", apache2]
+          register: apache_package_before
+          changed_when: false
+          failed_when: false
+
+        - name: Registrar estado inicial do Apache
+          ansible.builtin.set_fact:
+            apache_installed: >-
+              {{ apache_package_before.rc == 0 and
+                 apache_package_before.stdout == 'install ok installed' }}
+
+        - name: Localizar Virtual Hosts disponíveis
+          ansible.builtin.find:
+            paths: /etc/apache2/sites-available
+            patterns: "*.conf"
+            file_type: file
+          become: true
+          register: available_vhosts
+          when: apache_installed
+
+        - name: Ler Virtual Hosts disponíveis
+          ansible.builtin.slurp:
+            src: "{{ item.path }}"
+          become: true
+          loop: "{{ available_vhosts.files | default([]) }}"
+          register: available_vhost_contents
+          loop_control:
+            label: "{{ item.path }}"
+
+        - name: Verificar marcadores de sites legados
+          ansible.builtin.stat:
+            path: >-
+              /var/www/{{ item.source | basename | regex_replace('\.conf$', '') }}/public_html/.apache-lab-manager-check
+          become: true
+          loop: "{{ available_vhost_contents.results | default([]) }}"
+          register: legacy_site_markers
+          loop_control:
+            label: "{{ item.source }}"
+
+        - name: Inicializar classificação dos Virtual Hosts
+          ansible.builtin.set_fact:
+            managed_vhosts: []
+            legacy_vhosts: []
+            unknown_vhosts: []
+            unknown_enabled_vhosts: []
+
+        - name: Classificar Virtual Hosts gerenciados e legados
+          ansible.builtin.set_fact:
+            managed_vhosts: "{{ managed_vhosts + ([vhost_entry] if is_managed else []) }}"
+            legacy_vhosts: "{{ legacy_vhosts + ([vhost_entry] if is_legacy else []) }}"
+          vars:
+            decoded_vhost: "{{ item.content | b64decode }}"
+            vhost_domain: "{{ item.source | basename | regex_replace('\\.conf$', '') }}"
+            is_managed: "{{ managed_marker in decoded_vhost }}"
+            is_legacy: >-
+              {{ managed_marker not in decoded_vhost and
+                 legacy_site_markers.results[site_index].stat.exists and
+                 ('DocumentRoot /var/www/' ~ vhost_domain ~ '/public_html') in decoded_vhost }}
+            vhost_entry:
+              path: "{{ item.source }}"
+              domain: "{{ vhost_domain }}"
+              content: "{{ decoded_vhost }}"
+              ports: "{{ decoded_vhost | regex_findall('(?im)<VirtualHost[^>]*:([0-9]+)[^>]*>') | map('int') | unique | list }}"
+              legacy: "{{ is_legacy }}"
+          loop: "{{ available_vhost_contents.results | default([]) }}"
+          loop_control:
+            index_var: site_index
+            label: "{{ item.source }}"
+
+        - name: Classificar Virtual Hosts desconhecidos
+          ansible.builtin.set_fact:
+            unknown_vhosts: "{{ unknown_vhosts + [item.source] }}"
+          vars:
+            known_paths: >-
+              {{ (managed_vhosts | map(attribute='path') | list) +
+                 ((legacy_vhosts | map(attribute='path') | list) if allow_legacy else []) }}
+          when:
+            - item.source not in known_paths
+            - item.source | basename not in ['000-default.conf', 'default-ssl.conf']
+          loop: "{{ available_vhost_contents.results | default([]) }}"
+          loop_control:
+            label: "{{ item.source }}"
+
+        - name: Localizar Virtual Hosts habilitados
+          ansible.builtin.find:
+            paths: /etc/apache2/sites-enabled
+            patterns: "*.conf"
+            file_type: any
+          become: true
+          register: enabled_vhosts
+          when: apache_installed
+
+        - name: Localizar configurações Listen gerenciadas
+          ansible.builtin.find:
+            paths: /etc/apache2/conf-available
+            patterns: "apache-lab-listen-*.conf"
+            file_type: file
+          become: true
+          register: managed_listen_configs
+          when: apache_installed
+
+        - name: Classificar Virtual Hosts habilitados desconhecidos
+          ansible.builtin.set_fact:
+            unknown_enabled_vhosts: "{{ unknown_enabled_vhosts + [item.path] }}"
+          vars:
+            known_basenames: >-
+              {{ (managed_vhosts | map(attribute='path') | map('basename') | list) +
+                 ((legacy_vhosts | map(attribute='path') | map('basename') | list) if allow_legacy else []) +
+                 ['000-default.conf', 'default-ssl.conf'] }}
+          when: item.path | basename not in known_basenames
+          loop: "{{ enabled_vhosts.files | default([]) }}"
+          loop_control:
+            label: "{{ item.path }}"
+
+        - name: Definir recursos solicitados para remoção
+          ansible.builtin.set_fact:
+            removable_vhosts: >-
+              {{ managed_vhosts + (legacy_vhosts if allow_legacy else []) }}
+
+        - name: Selecionar um site específico
+          ansible.builtin.set_fact:
+            target_vhosts: "{{ removable_vhosts | selectattr('domain', 'equalto', site_domain) | list }}"
+            requested_vhost_exists: >-
+              {{ (available_vhost_contents.results | default([])
+                  | selectattr('source', 'equalto', '/etc/apache2/sites-available/' ~ site_domain ~ '.conf')
+                  | list | length) > 0 }}
+          when: teardown_operation == 'site'
+
+        - name: Selecionar todos os sites comprovadamente gerenciados
+          ansible.builtin.set_fact:
+            target_vhosts: "{{ removable_vhosts }}"
+          when: teardown_operation in ['all', 'uninstall']
+
+        - name: Simular purga dos pacotes Apache
+          ansible.builtin.command:
+            argv: [apt-get, -s, purge, apache2, apache2-bin, apache2-data, apache2-utils]
+          become: true
+          register: apt_purge_simulation
+          changed_when: false
+          failed_when: false
+          when:
+            - teardown_operation == 'uninstall'
+            - apache_installed
+
+        - name: Interpretar impacto simulado da purga
+          ansible.builtin.set_fact:
+            apt_simulated_removals: >-
+              {{ apt_purge_simulation.stdout | default('')
+                 | regex_findall('(?m)^Remv\s+([^\s]+)') | unique | list }}
+            unexpected_package_removals: >-
+              {{ (apt_purge_simulation.stdout | default('')
+                  | regex_findall('(?m)^Remv\s+([^\s]+)') | unique | list)
+                 | difference(apache_packages) }}
+          when:
+            - teardown_operation == 'uninstall'
+            - apache_installed
+
+        - name: Apresentar plano por servidor
+          ansible.builtin.debug:
+            msg: |-
+              ============================================================
+              Servidor: {{ inventory_hostname }}
+              Operação: {{ teardown_operation }}
+              Apache instalado: {{ 'sim' if apache_installed else 'não' }}
+              Sites gerenciados encontrados: {{ managed_vhosts | map(attribute='domain') | list | join(', ') or 'nenhum' }}
+              Sites legados comprovados: {{ legacy_vhosts | map(attribute='domain') | list | join(', ') or 'nenhum' }}
+              Sites selecionados para remoção: {{ target_vhosts | map(attribute='domain') | list | join(', ') or 'nenhum' }}
+              Virtual Hosts a remover: {{ target_vhosts | map(attribute='path') | list | join(', ') or 'nenhum' }}
+              Configurações Listen gerenciadas encontradas: {{ managed_listen_configs.files | default([]) | map(attribute='path') | list | join(', ') or 'nenhuma' }}
+              Diretórios a remover: {{ (target_vhosts | map(attribute='domain') | map('regex_replace', '^(.*)$', '/var/www/\\1') | list | join(', ')) if delete_site_content else 'preservados' }}
+              Virtual Hosts não gerenciados preservados: {{ unknown_vhosts | join(', ') or 'nenhum' }}
+              Virtual Hosts habilitados desconhecidos: {{ unknown_enabled_vhosts | join(', ') or 'nenhum' }}
+              Serviço afetado: {{ 'apache2 (stop/disable)' if teardown_operation == 'uninstall' else 'apache2 (reload somente se necessário)' }}
+              Pacotes a purgar: {{ apache_packages | join(', ') if teardown_operation == 'uninstall' and apache_installed else 'nenhum' }}
+              Simulação apt: {{ apt_purge_simulation.stdout_lines | default([]) | select('match', '^Remv ') | list | join(' | ') or 'sem remoções adicionais informadas' }}
+              ============================================================
+
+        - name: Executar remoção confirmada
+          when: teardown_phase == 'apply'
+          block:
+            - name: Bloquear site específico sem propriedade comprovada
+              ansible.builtin.assert:
+                that: target_vhosts | length > 0 or not requested_vhost_exists
+                fail_msg: >-
+                  O site {{ site_domain }} existe, mas não foi comprovado como recurso do
+                  Apache Lab Manager. Nada foi removido.
+              when: teardown_operation == 'site'
+
+            - name: Bloquear desinstalação com Virtual Hosts desconhecidos
+              ansible.builtin.assert:
+                that:
+                  - unknown_vhosts | length == 0
+                  - unknown_enabled_vhosts | length == 0
+                fail_msg: >-
+                  Desinstalação bloqueada. Virtual Hosts não gerenciados seriam afetados:
+                  {{ (unknown_vhosts + unknown_enabled_vhosts) | unique | join(', ') }}.
+              when: teardown_operation == 'uninstall'
+
+            - name: Bloquear desinstalação com impacto inesperado em pacotes
+              ansible.builtin.assert:
+                that:
+                  - apt_purge_simulation.rc == 0
+                  - unexpected_package_removals | default([]) | length == 0
+                fail_msg: >-
+                  Desinstalação bloqueada. A simulação apt indicou impacto fora dos
+                  pacotes Apache permitidos: {{ unexpected_package_removals | default([]) | join(', ') }}.
+              when:
+                - teardown_operation == 'uninstall'
+                - apache_installed
+
+            - name: Desabilitar Virtual Hosts selecionados
+              ansible.builtin.file:
+                path: "/etc/apache2/sites-enabled/{{ item.domain }}.conf"
+                state: absent
+              become: true
+              loop: "{{ target_vhosts }}"
+              register: disabled_sites
+              loop_control:
+                label: "{{ item.domain }}"
+
+            - name: Remover configurações dos Virtual Hosts selecionados
+              ansible.builtin.file:
+                path: "{{ item.path }}"
+                state: absent
+              become: true
+              loop: "{{ target_vhosts }}"
+              register: removed_vhost_files
+              loop_control:
+                label: "{{ item.path }}"
+
+            - name: Localizar configurações restantes
+              ansible.builtin.find:
+                paths: /etc/apache2/sites-available
+                patterns: "*.conf"
+                file_type: file
+              become: true
+              register: remaining_vhost_files
+              when: apache_installed
+
+            - name: Ler configurações restantes
+              ansible.builtin.slurp:
+                src: "{{ item.path }}"
+              become: true
+              loop: "{{ remaining_vhost_files.files }}"
+              register: remaining_vhost_contents
+              loop_control:
+                label: "{{ item.path }}"
+
+            - name: Consolidar portas e configurações restantes
+              ansible.builtin.set_fact:
+                candidate_listen_ports: >-
+                  {{ ((target_vhosts | map(attribute='ports') | flatten | list) +
+                      ((managed_listen_configs.files | default([]) | map(attribute='path') | map('basename')
+                        | map('regex_replace', '^apache-lab-listen-([0-9]+)\\.conf$', '\\1')
+                        | map('int') | list) if teardown_operation in ['all', 'uninstall'] else []))
+                     | unique | list }}
+                remaining_vhost_text: >-
+                  {{ remaining_vhost_contents.results | default([]) | map(attribute='content')
+                     | map('b64decode') | join('\n') }}
+
+            - name: Remover ativação Listen sem dependências restantes
+              ansible.builtin.file:
+                path: "/etc/apache2/conf-enabled/apache-lab-listen-{{ item }}.conf"
+                state: absent
+              become: true
+              loop: "{{ candidate_listen_ports }}"
+              when: >-
+                teardown_operation == 'uninstall' or
+                remaining_vhost_text is not regex('(?im)<VirtualHost[^>]*:' ~ (item | string) ~ '[^>]*>')
+              register: removed_listen_links
+
+            - name: Remover configuração Listen sem dependências restantes
+              ansible.builtin.file:
+                path: "/etc/apache2/conf-available/apache-lab-listen-{{ item }}.conf"
+                state: absent
+              become: true
+              loop: "{{ candidate_listen_ports }}"
+              when: >-
+                teardown_operation == 'uninstall' or
+                remaining_vhost_text is not regex('(?im)<VirtualHost[^>]*:' ~ (item | string) ~ '[^>]*>')
+              register: removed_listen_files
+
+            - name: Validar configuração após remoção
+              ansible.builtin.command:
+                argv: [apache2ctl, configtest]
+              become: true
+              register: teardown_configtest
+              changed_when: false
+              failed_when: false
+              when:
+                - apache_installed
+                - teardown_operation != 'uninstall'
+
+            - name: Exigir configuração válida antes do reload
+              ansible.builtin.assert:
+                that: teardown_configtest.rc == 0
+                fail_msg: "Configuração inválida após remoção; reload não executado."
+              when:
+                - apache_installed
+                - teardown_operation != 'uninstall'
+
+            - name: Recarregar Apache somente quando houve alteração
+              ansible.builtin.systemd_service:
+                name: apache2
+                state: reloaded
+              become: true
+              when:
+                - apache_installed
+                - teardown_operation != 'uninstall'
+                - >-
+                  (disabled_sites.results | default([]) | selectattr('changed') | list | length > 0) or
+                  (removed_vhost_files.results | default([]) | selectattr('changed') | list | length > 0) or
+                  (removed_listen_files.results | default([]) | selectattr('changed') | list | length > 0)
+
+            - name: Confirmar ausência do Virtual Host removido
+              ansible.builtin.command:
+                argv: [apache2ctl, -S]
+              register: apache_vhost_dump
+              changed_when: false
+              failed_when: false
+              when:
+                - apache_installed
+                - teardown_operation != 'uninstall'
+
+            - name: Verificar que domínios removidos não pertencem mais ao Virtual Host
+              ansible.builtin.assert:
+                that: item.domain not in ((apache_vhost_dump.stdout | default('')) ~ (apache_vhost_dump.stderr | default('')))
+                fail_msg: "O domínio {{ item.domain }} ainda aparece no mapa de Virtual Hosts."
+              loop: "{{ target_vhosts }}"
+              when:
+                - apache_installed
+                - teardown_operation != 'uninstall'
+
+            - name: Remover conteúdo confirmado dos sites
+              ansible.builtin.file:
+                path: "/var/www/{{ item.domain }}"
+                state: absent
+              become: true
+              loop: "{{ target_vhosts }}"
+              when: delete_site_content
+              register: removed_site_directories
+
+            - name: Parar e desabilitar Apache para desinstalação
+              ansible.builtin.systemd_service:
+                name: apache2
+                state: stopped
+                enabled: false
+              become: true
+              when:
+                - teardown_operation == 'uninstall'
+                - apache_installed
+
+            - name: Purgar somente pacotes Apache explícitos
+              ansible.builtin.apt:
+                name: "{{ apache_packages }}"
+                state: absent
+                purge: true
+                autoremove: false
+              become: true
+              register: apache_purge
+              when:
+                - teardown_operation == 'uninstall'
+                - apache_installed
+
+            - name: Registrar resultado do teardown
+              ansible.builtin.set_fact:
+                teardown_status: "concluído"
+                removed_sites: "{{ target_vhosts | map(attribute='domain') | list if delete_site_content else [] }}"
+                removed_vhosts: "{{ target_vhosts | map(attribute='path') | list }}"
+                removed_listens: >-
+                  {{ removed_listen_files.results | default([]) | selectattr('changed')
+                     | map(attribute='item') | map('string') | list }}
+                packages_removed: "{{ apache_packages if teardown_operation == 'uninstall' and apache_installed else [] }}"
+
+      rescue:
+        - name: Registrar bloqueio ou falha por servidor
+          ansible.builtin.set_fact:
+            teardown_status: "bloqueado ou incompleto"
+            teardown_error: >-
+              {{ ansible_failed_result.msg
+                 | default(ansible_failed_result.stderr)
+                 | default('erro não identificado') }}
+
+      always:
+        - name: Consultar estado final do Apache
+          ansible.builtin.command:
+            argv: [systemctl, is-active, apache2]
+          register: apache_state_final
+          changed_when: false
+          failed_when: false
+
+        - name: Verificar pacote Apache ao final
+          ansible.builtin.command:
+            argv: [dpkg-query, -W, "-f=${Status}", apache2]
+          register: apache_package_final
+          changed_when: false
+          failed_when: false
+
+        - name: Exibir relatório do teardown
+          ansible.builtin.debug:
+            msg: |-
+              ============================================================
+              Servidor: {{ inventory_hostname }}
+              Fase: {{ teardown_phase }}
+              Status: {{ teardown_status }}
+              Sites removidos: {{ removed_sites | join(', ') or 'nenhum' }}
+              Virtual Hosts removidos: {{ removed_vhosts | join(', ') or 'nenhum' }}
+              Configurações Listen removidas: {{ removed_listens | join(', ') or 'nenhuma' }}
+              Estado final do Apache: {{ apache_state_final.stdout | default('ausente/indisponível') }}
+              Pacotes desinstalados: {{ packages_removed | join(', ') or 'nenhum' }}
+              Recursos preservados: inventário, sites desconhecidos, K3s, Traefik, n8n, firewall, DNS e demais serviços
+              Erros/ações pendentes: {{ teardown_error }}
+              ============================================================
